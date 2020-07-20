@@ -1267,6 +1267,30 @@ class LeBail:
         if(param_file is not None):
             if(path.exists(param_file)):
                 params.load(param_file)
+                '''
+                this part initializes the lattice parameters in the 
+                paramter list
+                '''
+                for p in self.phases:
+
+                    mat = self.phases[p]
+                    lp       = np.array(mat.lparms)
+                    rid      = list(_rqpDict[mat.latticeType][0])
+
+                    lp       = lp[rid]
+                    name     = _lpname[rid]
+
+                    for n,l in zip(name,lp):
+                        nn = p+'_'+n
+                        '''
+                        is l is small, it is one of the length units
+                        else it is an angle
+                        '''
+                        if(l < 10.):
+                            params.add(nn,value=l,lb=l-0.05,ub=l+0.05,vary=False)
+                        else:
+                            params.add(nn,value=l,lb=l-1.,ub=l+1.,vary=False)
+
             else:
                 raise FileError('parameter file doesn\'t exist.')
         else:
@@ -1292,6 +1316,9 @@ class LeBail:
         self._U = self.params['U'].value
         self._V = self.params['V'].value
         self._W = self.params['W'].value
+        self._P = self.params['P'].value
+        self._X = self.params['X'].value
+        self._Y = self.params['Y'].value
         self._eta1 = self.params['eta1'].value
         self._eta2 = self.params['eta2'].value
         self._eta3 = self.params['eta3'].value
@@ -1371,7 +1398,12 @@ class LeBail:
         >> @DATE:       06/08/2020 SS 1.0 original
         >> @DETAILS:    load the phases for the LeBail fits
         '''
-        p = Phases_LeBail(wavelength=self.wavelength)
+        if(hasattr(self,'wavelength')):
+            if(self.wavelength is not None):
+                p = Phases_LeBail(wavelength=self.wavelength)
+        else:
+            p = Phases_LeBail()
+
         if(phase_file is not None):
             if(path.exists(phase_file)):
                 p.load(phase_file)
@@ -1413,6 +1445,17 @@ class LeBail:
             Hsq = 1.0e-12
         self.Hcag   = np.sqrt(Hsq)
 
+    def LorentzH(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       07/20/2020 SS 1.0 original
+        >> @DETAILS:    calculates the size and strain broadening for Lorentzian peak
+        '''
+        th = np.radians(0.5*tth)
+        tanth       = np.tan(th)
+        cth         = np.cos(th)
+        self.gamma = self.X/cth + self.Y * tanth
+
     def MixingFact(self, tth):
         '''
         >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
@@ -1445,7 +1488,8 @@ class LeBail:
         >> @DETAILS:    this routine computes the lorentzian peak profile
         '''
 
-        H = self.Hcag
+        # H = self.Hcag
+        H = self.gamma
         cl = 4.
         self.LorentzI = (2./np.pi/H) / ( 1. + cl*((self.tth_list - tth)/H)**2)
 
@@ -1459,6 +1503,7 @@ class LeBail:
 
         self.CagliottiH(tth)
         self.Gaussian(tth)
+        self.LorentzH(tth)
         self.Lorentzian(tth)
         self.MixingFact(tth)
         self.PV = self.eta * self.GaussianI + \
@@ -1549,30 +1594,38 @@ class LeBail:
         for p in params:
             setattr(self, p, params[p].value)
 
-        lp = []
-        if('a' in params):
-            if(params['a'].vary):
-                lp.append(params['a'].value)
-        if('b' in params):
-            if(params['b'].vary):
-                lp.append(params['b'].value)
-        if('c' in params):
-            if(params['c'].vary):
-                lp.append(params['c'].value)
-        if('alpha' in params):
-            if(params['alpha'].vary):
-                lp.append(params['alpha'].value)
-        if('beta' in params):
-            if(params['beta'].vary):
-                lp.append(params['beta'].value)
-        if('gamma' in params):
-            if(params['gamma'].vary):
-                lp.append(params['gamma'].value)
+        for p in self.phases:
 
-        if(not lp):
-            pass
-        else:
-            for p in self.phases:
+            mat = self.phases[p]
+
+            '''
+            PART 1: update the lattice parameters
+            '''
+            lp = []
+
+            pre = p + '_'
+            if(pre+'a' in params):
+                if(params[pre+'a'].vary):
+                    lp.append(params[pre+'a'].value)
+            if(pre+'b' in params):
+                if(params[pre+'b'].vary):
+                    lp.append(params[pre+'b'].value)
+            if(pre+'c' in params):
+                if(params[pre+'c'].vary):
+                    lp.append(params[pre+'c'].value)
+            if(pre+'alpha' in params):
+                if(params[pre+'alpha'].vary):
+                    lp.append(params[pre+'alpha'].value)
+            if(pre+'beta' in params):
+                if(params[pre+'beta'].vary):
+                    lp.append(params[pre+'beta'].value)
+            if(pre+'gamma' in params):
+                if(params[pre+'gamma'].vary):
+                    lp.append(params[pre+'gamma'].value)
+
+            if(not lp):
+                pass
+            else:
                 lp = self.phases[p].Required_lp(lp)
                 self.phases[p].lparms = np.array(lp)
                 self.phases[p]._calcrmt()
@@ -1686,6 +1739,41 @@ class LeBail:
         self._W = Winp
         # self.computespectrum()
         return
+
+    @property
+    def P(self):
+        return self._P
+
+    @P.setter
+    def P(self, Pinp):
+        self._P = Pinp
+        return
+
+    @property
+    def X(self):
+        return self._X
+
+    @X.setter
+    def X(self, Xinp):
+        self._X = Xinp
+        return
+
+    @property
+    def Y(self):
+        return self._Y
+
+    @Y.setter
+    def Y(self, Yinp):
+        self._Y = Yinp
+        return
+
+    @property
+    def gamma(self):
+        return self._gamma
+    
+    @gamma.setter
+    def gamma(self, val):
+        self._gamma = val
 
     @property
     def Hcag(self):
@@ -3364,6 +3452,7 @@ class Rietveld:
         '''
         th          = np.radians(0.5*tth)
         tanth       = np.tan(th)
+        cth         = np.cos(th)
         Hsq         = self.U * tanth**2 + self.V * tanth + self.W
         if(Hsq < 0.):
             Hsq = 1.0e-12
@@ -3415,6 +3504,7 @@ class Rietveld:
 
         self.CagliottiH(tth)
         self.Gaussian(tth)
+        self.LorentzH(tth)
         self.Lorentzian(tth)
         self.MixingFact(tth)
 
