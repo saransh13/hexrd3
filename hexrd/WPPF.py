@@ -1233,8 +1233,8 @@ class LeBail:
             self.wavelength = wavelength
 
         self._tstart = time.time()
-        self.initialize_parameters(param_file)
         self.initialize_phases(phase_file)
+        self.initialize_parameters(param_file)
         self.initialize_Icalc()
         self.computespectrum()
 
@@ -1488,7 +1488,6 @@ class LeBail:
         >> @DETAILS:    this routine computes the lorentzian peak profile
         '''
 
-        # H = self.Hcag
         H = self.gamma
         cl = 4.
         self.LorentzI = (2./np.pi/H) / ( 1. + cl*((self.tth_list - tth)/H)**2)
@@ -1592,7 +1591,8 @@ class LeBail:
         the err variable is the difference between simulated and experimental spectra
         '''
         for p in params:
-            setattr(self, p, params[p].value)
+            if(hasattr(self, p)):
+                setattr(self, p, params[p].value)
 
         for p in self.phases:
 
@@ -1825,6 +1825,736 @@ class LeBail:
     def zero_error(self, value):
         self._zero_error = value
         # self.computespectrum()
+        return
+
+class LeBail_Asym:
+    ''' ======================================================================================================== 
+        ======================================================================================================== 
+
+    >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+    >> @DATE:       05/19/2020 SS 1.0 original
+    >> @DETAILS:    this is the main LeBail class and contains all the refinable parameters
+                    for the analysis. Since the LeBail method has no structural information 
+                    during refinement, the refinable parameters for this model will be:
+
+                    1. a, b, c, alpha, beta, gamma : unit cell parameters
+                    2. U, V, W : cagliotti paramaters
+                    3. 2theta_0 : Instrumental zero shift error
+                    4. eta1, eta2, eta3 : weight factor for gaussian vs lorentzian
+
+                    @NOTE: All angles are always going to be in degrees
+        ======================================================================================================== 
+        ======================================================================================================== 
+    '''
+
+    def __init__(self,expt_file=None,param_file=None,phase_file=None,wavelength=None):
+
+        self.initialize_expt_spectrum(expt_file)
+
+        if(wavelength is not None):
+            self.wavelength = wavelength
+
+        self._tstart = time.time()
+        self.initialize_phases(phase_file)
+        self.initialize_parameters(param_file)
+        self.initialize_Icalc()
+        self.computespectrum()
+
+        self._tstop = time.time()
+        self.tinit = self._tstop - self._tstart
+        self.niter = 0
+        self.Rwplist  = np.empty([0])
+        self.gofFlist = np.empty([0])
+
+    def __str__(self):
+        resstr = '<LeBail Fit class>\nParameters of the model are as follows:\n'
+        resstr += self.params.__str__()
+        return resstr
+
+    def checkangle(ang, name):
+
+        if(np.abs(ang) > 180.):
+            warnings.warn(name + " : the absolute value of angles \
+                                seems to be large > 180 degrees")
+
+    def initialize_parameters(self, param_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    initialize parameter list from file. if no file given, then initialize
+                        to some default values (lattice constants are for CeO2)
+
+        '''
+        params = Parameters()
+        if(param_file is not None):
+            if(path.exists(param_file)):
+                params.load(param_file)
+                '''
+                this part initializes the lattice parameters in the 
+                paramter list
+                '''
+                for p in self.phases:
+
+                    mat = self.phases[p]
+                    lp       = np.array(mat.lparms)
+                    rid      = list(_rqpDict[mat.latticeType][0])
+
+                    lp       = lp[rid]
+                    name     = _lpname[rid]
+
+                    for n,l in zip(name,lp):
+                        nn = p+'_'+n
+                        '''
+                        is l is small, it is one of the length units
+                        else it is an angle
+                        '''
+                        if(l < 10.):
+                            params.add(nn,value=l,lb=l-0.05,ub=l+0.05,vary=False)
+                        else:
+                            params.add(nn,value=l,lb=l-1.,ub=l+1.,vary=False)
+
+            else:
+                raise FileError('parameter file doesn\'t exist.')
+        else:
+            '''
+                first 6 are the lattice paramaters
+                next three are cagliotti parameters
+                next are the three gauss+lorentz mixing paramters
+                final is the zero instrumental peak position error
+            '''
+            names   = ('a','b','c','alpha','beta','gamma',\
+                      'U','V','W','eta1','eta2','eta3','tth_zero')
+            values  = (5.415, 5.415, 5.415, 90., 90., 90., \
+                        0.5, 0.5, 0.5, 1e-3, 1e-3, 1e-3, 0.)
+
+            lbs         = (-np.Inf,) * len(names)
+            ubs         = (np.Inf,)  * len(names)
+            varies  = (False,)   * len(names)
+
+            params.add_many(names,values=values,varies=varies,lbs=lbs,ubs=ubs)
+
+        self.params = params
+
+        self._Ul = self.params['Ul'].value
+        self._Vl = self.params['Vl'].value
+        self._Wl = self.params['Wl'].value
+        self._Pl = self.params['Pl'].value
+        self._Xl = self.params['Xl'].value
+        self._Yl = self.params['Yl'].value
+        self._Ur = self.params['Ur'].value
+        self._Vr = self.params['Vr'].value
+        self._Wr = self.params['Wr'].value
+        self._Pr = self.params['Pr'].value
+        self._Xr = self.params['Xr'].value
+        self._Yr = self.params['Yr'].value
+        self._eta1 = self.params['eta1'].value
+        self._eta2 = self.params['eta2'].value
+        self._eta3 = self.params['eta3'].value
+        self._zero_error = self.params['zero_error'].value
+
+    def params_vary_off(self):
+        '''
+            no params are varied
+        '''
+        for p in self.params:
+            self.params[p].vary = False
+
+    def params_vary_on(self):
+        '''
+            all params are varied
+        '''
+        for p in self.params:
+            self.params[p].vary = True
+
+
+    def initialize_expt_spectrum(self, expt_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    load the experimental spectum of 2theta-intensity
+        '''
+        # self.spectrum_expt = Spectrum.from_file()
+        if(expt_file is not None):
+            if(path.exists(expt_file)):
+                self.spectrum_expt = Spectrum.from_file(expt_file,skip_rows=0)
+                self.tth_max = np.amax(self.spectrum_expt._x)
+                self.tth_min = np.amin(self.spectrum_expt._x)
+
+                ''' also initialize statistical weights for the error calculation'''
+                self.weights = 1.0 / np.sqrt(self.spectrum_expt.y)
+                self.initialize_bkg()
+            else:
+                raise FileError('input spectrum file doesn\'t exist.')
+
+    def initialize_bkg(self):
+
+        '''
+            the cubic spline seems to be the ideal route in terms
+            of determining the background intensity. this involves 
+            selecting a small (~5) number of points from the spectrum,
+            usually called the anchor points. a cubic spline interpolation
+            is performed on this subset to estimate the overall background.
+            scipy provides some useful routines for this
+        '''
+        self.selectpoints()
+        x = self.points[:,0]
+        y = self.points[:,1]
+        self.splinefit(x, y)
+
+    def selectpoints(self):
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        ax.set_title('Select 5 points for background estimation')
+
+        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=8)  # 5 points tolerance
+        plt.show()
+
+        self.points = np.asarray(plt.ginput(8,timeout=-1, show_clicks=True))
+        plt.close()
+
+    # cubic spline fit of background using custom points chosen from plot
+    def splinefit(self, x, y):
+        cs = CubicSpline(x,y)
+        bkg = cs(self.tth_list)
+        self.background = Spectrum(x=self.tth_list, y=bkg)
+
+
+    def initialize_phases(self, phase_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    load the phases for the LeBail fits
+        '''
+        if(hasattr(self,'wavelength')):
+            if(self.wavelength is not None):
+                p = Phases_LeBail(wavelength=self.wavelength)
+        else:
+            p = Phases_LeBail()
+
+        if(phase_file is not None):
+            if(path.exists(phase_file)):
+                p.load(phase_file)
+            else:
+                raise FileError('phase file doesn\'t exist.')
+        self.phases = p
+
+        self.calctth()
+
+    def calctth(self):
+        self.tth = {}
+        for p in self.phases:
+            self.tth[p] = {}
+            for k,l in self.phases.wavelength.items():
+                t = self.phases[p].getTTh(l.value)
+                limit = np.logical_and(t >= self.tth_min,\
+                                       t <= self.tth_max)
+                self.tth[p][k] = t[limit]
+
+    def initialize_Icalc(self):
+
+        self.Icalc = {}
+        for p in self.phases:
+            self.Icalc[p] = {}
+            for k,l in self.phases.wavelength.items():
+
+                self.Icalc[p][k] = 1000.0 * np.ones(self.tth[p][k].shape)
+
+    def CagliottiH(self, tth, branch):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+                        07/20/2020 SS 1.1 branch keyword for asymmetric profiles
+        >> @DETAILS:    calculates the cagiotti parameter for the peak width
+
+        '''
+        th          = np.radians(0.5*tth)
+        tanth       = np.tan(th)
+        cth         = np.cos(th)
+        if(branch == 'l'):
+            Hsq         = self.Ul * tanth**2 + self.Vl * tanth + self.Wl + self.Pl / cth**2
+        elif(branch == 'r'):
+            Hsq         = self.Ur * tanth**2 + self.Vr * tanth + self.Wr + self.Pr / cth**2
+
+        if(Hsq < 0.):
+            Hsq = 1.0e-12
+        self.Hcag   = np.sqrt(Hsq)
+
+    def LorentzH(self, tth, branch):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       07/20/2020 SS 1.0 original
+        >> @DETAILS:    calculates the size and strain broadening for Lorentzian peak
+        '''
+        th = np.radians(0.5*tth)
+        tanth       = np.tan(th)
+        cth         = np.cos(th)
+        if(branch == 'l'):
+            self.gamma = self.Xl/cth + self.Yl * tanth
+        elif(branch == 'r'):
+            self.gamma = self.Xr/cth + self.Yr * tanth
+
+        if(self.gamma < 0.):
+            self.gamma = 1e-6
+
+    def MixingFact(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+        >> @DETAILS:    calculates the mixing factor eta
+        '''
+        self.eta = self.eta1 + self.eta2 * tth + self.eta3 * (tth)**2
+
+        if(self.eta > 1.0):
+            self.eta = 1.0
+
+        elif(self.eta < 0.0):
+            self.eta = 0.0
+
+    def Gaussian(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the gaussian peak profile
+        '''
+        mask = self.tth_list < tth
+        cg = 4.*np.log(2.)
+
+        self.CagliottiH(tth, 'l')
+        H  = self.Hcag
+        Il = (np.sqrt(cg/np.pi)/H) * np.exp( -cg * ((self.tth_list[mask] - tth)/H)**2 )
+
+        self.CagliottiH(tth, 'r')
+        H  = self.Hcag
+        Ir = (np.sqrt(cg/np.pi)/H) * np.exp( -cg * ((self.tth_list[~mask] - tth)/H)**2 )
+
+        if(Il.size == 0):
+            a = 0.
+            b = 1.
+        elif(Ir.size == 0):
+            a = 1.
+            b = 0.
+        else:
+            Ilm = np.amax(Il)
+            Irm = np.amax(Ir)
+            b = 2./(1. + Irm/Ilm)
+            a = b * Irm / Ilm
+
+        self.GaussianI = np.hstack((a*Il, b*Ir))
+
+    def Lorentzian(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the lorentzian peak profile
+        '''
+        mask = self.tth_list < tth
+        cl = 4.
+
+        self.LorentzH(tth, 'l')
+        H = self.gamma
+        Il = (2./np.pi/H) / ( 1. + cl*((self.tth_list[mask] - tth)/H)**2)
+
+        self.LorentzH(tth, 'r')
+        H = self.gamma
+        Ir = (2./np.pi/H) / ( 1. + cl*((self.tth_list[~mask] - tth)/H)**2)
+
+        if(Il.size == 0):
+            a = 0.
+            b = 1.
+        elif(Ir.size == 0):
+            a = 1.
+            b = 0.
+        else:
+            Ilm = np.amax(Il)
+            Irm = np.amax(Ir)
+            b = 2./(1. + Irm/Ilm)
+            a = b * Irm / Ilm
+
+        self.LorentzI = np.hstack((a*Il, b*Ir))
+
+    def PseudoVoight(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the pseudo-voight function as weighted 
+                        average of gaussian and lorentzian
+        '''
+
+        self.Gaussian(tth)
+        self.Lorentzian(tth)
+        self.MixingFact(tth)
+
+        self.PV = self.eta * self.GaussianI + \
+                  (1.0 - self.eta) * self.LorentzI
+
+    def IntegratedIntensity(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    Integrated intensity of the pseudo-voight peak
+        '''
+        return np.trapz(self.PV, self.tth_list)
+
+    def computespectrum(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    compute the simulated spectrum
+        '''
+        x = self.tth_list
+        y = np.zeros(x.shape)
+
+        for iph,p in enumerate(self.phases):
+
+            for k,l in self.phases.wavelength.items():
+        
+                Ic = self.Icalc[p][k]
+
+                tth = self.tth[p][k] + self.zero_error
+                n = np.min((tth.shape[0],Ic.shape[0]))
+
+                for i in range(n):
+
+                    t = tth[i]
+                    self.PseudoVoight(t)
+
+                    y += Ic[i] * self.PV
+
+        self.spectrum_sim = Spectrum(x=x, y=y)
+        self.spectrum_sim = self.spectrum_sim + self.background
+
+    def CalcIobs(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    this is one of the main functions to partition the expt intensities
+                        to overlapping peaks in the calculated pattern
+        '''
+
+        self.Iobs = {}
+        for iph,p in enumerate(self.phases):
+
+            self.Iobs[p] = {}
+
+            for k,l in self.phases.wavelength.items():
+                Ic = self.Icalc[p][k]
+
+                tth = self.tth[p][k] + self.zero_error
+
+                Iobs = []
+                n = np.min((tth.shape[0],Ic.shape[0]))
+
+                for i in range(n):
+                    t = tth[i]
+                    self.PseudoVoight(t)
+
+                    y   = self.PV * Ic[i]
+                    _,yo  = self.spectrum_expt.data
+                    _,yc  = self.spectrum_sim.data
+
+                    I = np.trapz(yo * y / yc, self.tth_list)
+                    Iobs.append(I)
+
+                self.Iobs[p][k] = np.array(Iobs)
+
+    def calcRwp(self, params):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the weighted error between calculated and
+                        experimental spectra. goodness of fit is also calculated. the 
+                        weights are the inverse squareroot of the experimental intensities
+        '''
+
+        '''
+        the err variable is the difference between simulated and experimental spectra
+        '''
+        for p in params:
+            if(hasattr(self, p)):
+                setattr(self, p, params[p].value)
+
+        for p in self.phases:
+
+            mat = self.phases[p]
+
+            '''
+            PART 1: update the lattice parameters
+            '''
+            lp = []
+
+            pre = p + '_'
+            if(pre+'a' in params):
+                if(params[pre+'a'].vary):
+                    lp.append(params[pre+'a'].value)
+            if(pre+'b' in params):
+                if(params[pre+'b'].vary):
+                    lp.append(params[pre+'b'].value)
+            if(pre+'c' in params):
+                if(params[pre+'c'].vary):
+                    lp.append(params[pre+'c'].value)
+            if(pre+'alpha' in params):
+                if(params[pre+'alpha'].vary):
+                    lp.append(params[pre+'alpha'].value)
+            if(pre+'beta' in params):
+                if(params[pre+'beta'].vary):
+                    lp.append(params[pre+'beta'].value)
+            if(pre+'gamma' in params):
+                if(params[pre+'gamma'].vary):
+                    lp.append(params[pre+'gamma'].value)
+
+            if(not lp):
+                pass
+            else:
+                lp = self.phases[p].Required_lp(lp)
+                self.phases[p].lparms = np.array(lp)
+                self.phases[p]._calcrmt()
+                self.calctth()
+
+        self.computespectrum()
+
+        self.err = (self.spectrum_sim - self.spectrum_expt)
+
+        errvec = np.sqrt(self.weights * self.err._y**2)
+
+        ''' weighted sum of square '''
+        wss = np.trapz(self.weights * self.err._y**2, self.err._x)
+
+        den = np.trapz(self.weights * self.spectrum_sim._y**2, self.spectrum_sim._x)
+
+        ''' standard Rwp i.e. weighted residual '''
+        Rwp = np.sqrt(wss/den)
+
+        ''' number of observations to fit i.e. number of data points '''
+        N = self.spectrum_sim._y.shape[0]
+
+        ''' number of independent parameters in fitting '''
+        P = len(params)
+        Rexp = np.sqrt((N-P)/den)
+
+        # Rwp and goodness of fit parameters
+        self.Rwp = Rwp
+        self.gofF = (Rwp / Rexp)**2
+
+        return errvec
+
+    def initialize_lmfit_parameters(self):
+
+        params = lmfit.Parameters()
+
+        for p in self.params:
+            par = self.params[p]
+            if(par.vary):
+                params.add(p, value=par.value, min=par.lb, max = par.ub)
+
+        return params
+
+    def update_parameters(self):
+
+        for p in self.res.params:
+            par = self.res.params[p]
+            self.params[p].value = par.value
+
+    def RefineCycle(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    this is one refinement cycle for the least squares, typically few
+                        10s to 100s of cycles may be required for convergence
+        '''
+        self.CalcIobs()
+        self.Icalc = self.Iobs
+
+        self.res = self.Refine()
+        self.update_parameters()
+        self.niter += 1
+        self.Rwplist  = np.append(self.Rwplist, self.Rwp)
+        self.gofFlist = np.append(self.gofFlist, self.gofF)
+        print('Finished iteration. Rwp: {:.3f} % goodness of fit: {:.3f}'.format(self.Rwp*100., self.gofF))
+
+    def Refine(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    this routine performs the least squares refinement for all variables
+                        which are allowed to be varied.
+        '''
+
+        params = self.initialize_lmfit_parameters()
+
+        fdict = {'ftol':1e-4, 'xtol':1e-4, 'gtol':1e-4, \
+                 'verbose':0, 'max_nfev':8}
+
+        fitter = lmfit.Minimizer(self.calcRwp, params)
+
+        res = fitter.least_squares(**fdict)
+        return res
+
+    @property
+    def Ul(self):
+        return self._Ul
+
+    @Ul.setter
+    def Ul(self, Uinp):
+        self._Ul = Uinp
+        # self.computespectrum()
+        return
+
+    @property
+    def Vl(self):
+        return self._Vl
+
+    @Vl.setter
+    def Vl(self, Vinp):
+        self._Vl = Vinp
+        # self.computespectrum()
+        return
+
+    @property
+    def Wl(self):
+        return self._Wl
+
+    @Wl.setter
+    def Wl(self, Winp):
+        self._Wl = Winp
+        # self.computespectrum()
+        return
+
+    @property
+    def Pl(self):
+        return self._Pl
+
+    @Pl.setter
+    def Pl(self, Pinp):
+        self._Pl = Pinp
+        return
+
+    @property
+    def Xl(self):
+        return self._Xl
+
+    @Xl.setter
+    def Xl(self, Xinp):
+        self._Xl = Xinp
+        return
+
+    @property
+    def Yl(self):
+        return self._Yl
+
+    @Yl.setter
+    def Yl(self, Yinp):
+        self._Yl = Yinp
+        return
+
+    @property
+    def Ur(self):
+        return self._Ur
+
+    @Ur.setter
+    def Ur(self, Uinp):
+        self._Ur = Uinp
+        return
+
+    @property
+    def Vr(self):
+        return self._Vr
+
+    @Vr.setter
+    def Vr(self, Vinp):
+        self._Vr = Vinp
+        return
+
+    @property
+    def Wr(self):
+        return self._Wr
+
+    @Wr.setter
+    def Wr(self, Winp):
+        self._Wr = Winp
+        return
+
+    @property
+    def Pr(self):
+        return self._Pr
+
+    @Pr.setter
+    def Pr(self, Pinp):
+        self._Pr = Pinp
+        return
+
+    @property
+    def Xr(self):
+        return self._Xr
+
+    @Xr.setter
+    def Xr(self, Xinp):
+        self._Xr = Xinp
+        return
+
+    @property
+    def Yr(self):
+        return self._Yr
+
+    @Yr.setter
+    def Yr(self, Yinp):
+        self._Yr = Yinp
+        return
+
+    @property
+    def gamma(self):
+        return self._gamma
+    
+    @gamma.setter
+    def gamma(self, val):
+        self._gamma = val
+
+    @property
+    def Hcag(self):
+        return self._Hcag
+
+    @Hcag.setter
+    def Hcag(self, val):
+        self._Hcag = val
+
+    @property
+    def eta1(self):
+        return self._eta1
+
+    @eta1.setter
+    def eta1(self, val):
+        self._eta1 = val
+        return
+
+    @property
+    def eta2(self):
+        return self._eta2
+
+    @eta2.setter
+    def eta2(self, val):
+        self._eta2 = val
+        return
+
+    @property
+    def eta3(self):
+        return self._eta3
+
+    @eta3.setter
+    def eta3(self, val):
+        self._eta3 = val
+        return
+
+    @property
+    def tth_list(self):
+        return self.spectrum_expt._x
+
+    @property
+    def zero_error(self):
+        return self._zero_error
+    
+    @zero_error.setter
+    def zero_error(self, value):
+        self._zero_error = value
         return
 
 class Material_Rietveld:
@@ -2964,6 +3694,9 @@ class Rietveld:
         self._U = self.params['U'].value
         self._V = self.params['V'].value
         self._W = self.params['W'].value
+        self._P = self.params['P'].value
+        self._X = self.params['X'].value
+        self._Y = self.params['Y'].value
         self._eta1 = self.params['eta1'].value
         self._eta2 = self.params['eta2'].value
         self._eta3 = self.params['eta3'].value
@@ -3458,6 +4191,17 @@ class Rietveld:
             Hsq = 1.0e-12
         self.Hcag   = np.sqrt(Hsq)
 
+    def LorentzH(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       07/20/2020 SS 1.0 original
+        >> @DETAILS:    calculates the size and strain broadening for Lorentzian peak
+        '''
+        th = np.radians(0.5*tth)
+        tanth       = np.tan(th)
+        cth         = np.cos(th)
+        self.gamma = self.X / cth + self.Y * tanth
+
     def MixingFact(self, tth):
         '''
         >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
@@ -3546,7 +4290,8 @@ class Rietveld:
         the err variable is the difference between simulated and experimental spectra
         '''
         for p in params:
-            setattr(self, p, params[p].value)
+            if(hasattr(self, p)):
+                setattr(self, p, params[p].value)
 
         self.updated_lp = False
         self.updated_atominfo = False
@@ -3757,6 +4502,41 @@ class Rietveld:
     def W(self, Winp):
         self._W = Winp
         return
+
+    @property
+    def P(self):
+        return self._P
+
+    @P.setter
+    def P(self, Pinp):
+        self._P = Pinp
+        return
+
+    @property
+    def X(self):
+        return self._X
+
+    @X.setter
+    def X(self, Xinp):
+        self._X = Xinp
+        return
+
+    @property
+    def Y(self):
+        return self._Y
+
+    @Y.setter
+    def Y(self, Yinp):
+        self._Y = Yinp
+        return
+
+    @property
+    def gamma(self):
+        return self._gamma
+    
+    @gamma.setter
+    def gamma(self, val):
+        self._gamma = val
 
     @property
     def Hcag(self):
