@@ -4589,7 +4589,1212 @@ class Rietveld:
     @property
     def scale(self):
         return self._scale
+
+    @scale.setter
+    def scale(self, value):
+        self._scale = value
+        return
+
+class Rietveld_Asym:
+    ''' ======================================================================================================== 
+    ======================================================================================================== 
+
+    >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+    >> @DATE:       01/08/2020 SS 1.0 original
+                    07/13/2020 SS 2.0 complete rewrite to include new parameter/material/pattern class
+
+    >> @DETAILS:    this is the main rietveld class and contains all the refinable parameters
+                    for the analysis. the member classes are as follows (in order of initialization):
+
+                    1. Spectrum         contains the experimental spectrum
+                    2. Background       contains the background extracted from spectrum
+                    3. Refine           contains all the machinery for refinement
+        ======================================================================================================== 
+        ======================================================================================================== 
+    '''
+    def __init__(self,expt_file=None,param_file=None,phase_file=None,wavelength=None):
+
+
+        self.initialize_expt_spectrum(expt_file)
+        self._tstart = time.time()
+        if(wavelength is not None):
+            self.wavelength = wavelength
+        self.initialize_phases(phase_file)
+        self.initialize_parameters(param_file)
+
+        self.PolarizationFactor()
+        self.computespectrum()
+
+        self._tstop = time.time()
+        self.tinit = self._tstop - self._tstart
+
+        self.niter = 0
+        self.Rwplist  = np.empty([0])
+        self.gofFlist = np.empty([0])
+
+    def __str__(self):
+        resstr = '<Rietveld Fit class>\nParameters of the model are as follows:\n'
+        resstr += self.params.__str__()
+        return resstr
+
+    def initialize_parameters(self, param_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >>              07/15/2020 SS 1.1 modified to add lattice parameters, atom positions
+                        and isotropic DW factors
+        >> @DETAILS:    initialize parameter list from file. if no file given, then initialize
+                        to some default values (lattice constants are for CeO2)
+        '''
+        params = Parameters()
+        if(param_file is not None):
+            if(path.exists(param_file)):
+                params.load(param_file)
+                '''
+                this part initializes the lattice parameters, atom positions in asymmetric 
+                unit, occupation and the isotropic debye waller factor. the anisotropic DW 
+                factors will be added in the future
+                '''
+                for p in self.phases:
+                    l = list(self.phases[p].keys())[0]
+
+                    mat = self.phases[p][l] 
+                    lp       = np.array(mat.lparms)
+                    rid      = list(_rqpDict[mat.latticeType][0])
+
+                    lp       = lp[rid]
+                    name     = _lpname[rid]
+
+                    for n,l in zip(name,lp):
+                        nn = p+'_'+n
+                        '''
+                        is l is small, it is one of the length units
+                        else it is an angle
+                        '''
+                        if(l < 10.):
+                            params.add(nn,value=l,lb=l-0.05,ub=l+0.05,vary=False)
+                        else:
+                            params.add(nn,value=l,lb=l-1.,ub=l+1.,vary=False)
+
+                    atom_pos   = mat.atom_pos[:,0:3]
+                    occ        = mat.atom_pos[:,3]
+                    atom_type  = mat.atom_type
+
+                    atom_label = _getnumber(atom_type)
+                    self.atom_label = atom_label
+
+                    for i in range(atom_type.shape[0]):
+
+                        Z = atom_type[i]
+                        elem = constants.ptableinverse[Z]
+                        
+                        nn = p+'_'+elem+str(atom_label[i])+'_x'
+                        params.add(nn,value=atom_pos[i,0],lb=0.0,ub=1.0,vary=False)
+
+                        nn = p+'_'+elem+str(atom_label[i])+'_y'
+                        params.add(nn,value=atom_pos[i,1],lb=0.0,ub=1.0,vary=False)
+
+                        nn = p+'_'+elem+str(atom_label[i])+'_z'
+                        params.add(nn,value=atom_pos[i,2],lb=0.0,ub=1.0,vary=False)
+
+                        nn = p+'_'+elem+str(atom_label[i])+'_occ'
+                        params.add(nn,value=occ[i],lb=0.0,ub=1.0,vary=False)
+
+                        if(mat.aniU):
+                            U = mat.U
+                            for j in range(6):
+                                nn = p+'_'+elem+str(atom_label[i])+'_'+_nameU[j]
+                                params.add(nn,value=U[i,j],lb=-1e-3,ub=np.inf,vary=False)
+                        else:
+
+                            nn = p+'_'+elem+str(atom_label[i])+'_dw'
+                            params.add(nn,value=mat.U[i],lb=0.0,ub=np.inf,vary=False)
+
+            else:
+                raise FileError('parameter file doesn\'t exist.')
+        else:
+            '''
+                first 6 are the lattice paramaters
+                next three are cagliotti parameters
+                next are the three gauss+lorentz mixing paramters
+                final is the zero instrumental peak position error
+            '''
+            names   = ('a','b','c','alpha','beta','gamma',\
+                      'U','V','W','eta1','eta2','eta3','tth_zero',\
+                      'scale')
+            values  = (5.415, 5.415, 5.415, 90., 90., 90., \
+                        0.5, 0.5, 0.5, 1e-3, 1e-3, 1e-3, 0., \
+                        1.0)
+
+            lbs         = (-np.Inf,) * len(names)
+            ubs         = (np.Inf,)  * len(names)
+            varies  = (False,)   * len(names)
+
+            params.add_many(names,values=values,varies=varies,lbs=lbs,ubs=ubs)
+
+        self.params = params
+
+        self._scale = self.params['scale'].value
+
+        self._Ul = self.params['Ul'].value
+        self._Vl = self.params['Vl'].value
+        self._Wl = self.params['Wl'].value
+        self._Pl = self.params['Pl'].value
+        self._Xl = self.params['Xl'].value
+        self._Yl = self.params['Yl'].value
+
+        self._Ur = self.params['Ur'].value
+        self._Vr = self.params['Vr'].value
+        self._Wr = self.params['Wr'].value
+        self._Pr = self.params['Pr'].value
+        self._Xr = self.params['Xr'].value
+        self._Yr = self.params['Yr'].value
+
+        self._eta1 = self.params['eta1'].value
+        self._eta2 = self.params['eta2'].value
+        self._eta3 = self.params['eta3'].value
+
+        self._zero_error = self.params['zero_error'].value
+
+    '''
+        no params are varied
+    '''
+    def params_vary_off(self):
+
+        for p in self.params:
+            self.params[p].vary = False
+
+    '''
+            all params are varied
+    '''
+    def params_vary_on(self):
+
+        for p in self.params:
+            self.params[p].vary = True
+
+    '''
+        turn all cagliotti parameters on
+    '''
+    def params_cagliotti_vary_on(self):
+        self.params['Ul'].vary = True
+        self.params['Vl'].vary = True
+        self.params['Wl'].vary = True
+        self.params['Pl'].vary = True
+
+        self.params['Ur'].vary = True
+        self.params['Vr'].vary = True
+        self.params['Wr'].vary = True
+        self.params['Pr'].vary = True
+
+    '''
+        turn all cagliotti parameters off
+    '''
+    def params_cagliotti_vary_off(self):
+        self.params['Ul'].vary = False
+        self.params['Vl'].vary = False
+        self.params['Wl'].vary = False
+
+        self.params['Ur'].vary = False
+        self.params['Vr'].vary = False
+        self.params['Wr'].vary = False
+        self.params['Pr'].vary = False
+
+    '''
+        turn all lorentz half widths parameters on
+    '''
+    def params_lorentz_vary_on(self):
+        self.params['Xl'].vary = True
+        self.params['Yl'].vary = True
+
+        self.params['Xr'].vary = True
+        self.params['Yr'].vary = True
+
+    '''
+        turn all lorentz half widths parameters off
+    '''
+    def params_lorentz_vary_off(self):
+        self.params['Xl'].vary = False
+        self.params['Yl'].vary = False
+
+        self.params['Xr'].vary = False
+        self.params['Yr'].vary = False
+
+    '''
+        turn all mixing parameters on
+    '''
+    def params_eta_vary_on(self):
+        self.params['eta1'].vary = True
+        self.params['eta2'].vary = True
+        self.params['eta3'].vary = True
+
+    '''
+        turn all mixing parameters off
+    '''
+    def params_eta_vary_off(self):
+        self.params['eta1'].vary = False
+        self.params['eta2'].vary = False
+        self.params['eta3'].vary = False
+
+    '''
+        turn all lattice paramater on
+    '''
+    def params_lp_vary_all_on(self):
+
+        for p in self.phases:
+
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l] 
+            rid      = list(_rqpDict[mat.latticeType][0])
+            name     = _lpname[rid]
+            for n in name:
+                nn = p+'_'+n
+                self.params[nn].vary = True
+
+    '''
+        turn all lattice paramater off
+    '''
+    def params_lp_vary_all_off(self):
+
+        for p in self.phases:
+
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l] 
+            rid      = list(_rqpDict[mat.latticeType][0])
+            name     = _lpname[rid]
+            for n in name:
+                nn = p+'_'+n
+                self.params[nn].vary = False
+
+    '''
+        turn lattice paramater for a phase on
+    '''
+    def params_lp_vary_phase_on(self, phase_name):
+
+        l = list(self.phases[phase_name].keys())[0]
+        mat = self.phases[phase_name][l] 
+        rid      = list(_rqpDict[mat.latticeType][0])
+        name     = _lpname[rid]
+        for n in name:
+            nn = phase_name+'_'+n
+            self.params[nn].vary = True
+
+    '''
+        turn lattice paramater for a phase off
+    '''
+    def params_lp_vary_phase_off(self, phase_name):
+
+        l = list(self.phases[phase_name].keys())[0]
+        mat = self.phases[phase_name][l] 
+        rid      = list(_rqpDict[mat.latticeType][0])
+        name     = _lpname[rid]
+        for n in name:
+            nn = phase_name+'_'+n
+            self.params[nn].vary = False
+
+    '''
+        turn all the debye waller factors on
+    '''
+    def params_U_vary_all_on(self):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem = constants.ptableinverse[Z]
+
+                if(mat.aniU):
+                    U = mat.U
+                    for j in range(6):
+                        nn = p+'_'+elem+str(self.atom_label[i])+'_'+_nameU[j]
+                        self.params[nn].vary = True
+                else:
+
+                    nn = p+'_'+elem+str(self.atom_label[i])+'_dw'
+                    self.params[nn].vary = True
+
+    '''
+        turn all the debye waller factors on
+    '''
+    def params_U_vary_all_off(self):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem = constants.ptableinverse[Z]
+
+                if(mat.aniU):
+                    U = mat.U
+                    for j in range(6):
+                        nn = p+'_'+elem+str(self.atom_label[i])+'_'+_nameU[j]
+                        self.params[nn].vary = False
+                else:
+
+                    nn = p+'_'+elem+str(self.atom_label[i])+'_dw'
+                    self.params[nn].vary = False
+
+    '''
+        turn all the debye waller factors 
+        for an atom label off
+    '''
+    def params_U_vary_label_off(self, label):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+
+            elem_all = []
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem_all.append(constants.ptableinverse[Z])
+
+            elem = label[:-1]
+            if(elem in elem_all):
+                if(mat.aniU):
+                    U = mat.U
+                    for j in range(6):
+                        nn = p+'_'+label+'_'+_nameU[j]
+                        self.params[nn].vary = False
+                else:
+                    nn = p+'_'+label+'_dw'
+                    self.params[nn].vary = False
+            else:
+                raise ValueError('element not present any of the phases')
+
+    '''
+        turn all the debye waller factors 
+        for an atom label on
+    '''
+    def params_U_vary_label_on(self, label):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+
+            elem_all = []
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem_all.append(constants.ptableinverse[Z])
+
+            elem = label[:-1]
+            if(elem in elem_all):
+                if(mat.aniU):
+                    U = mat.U
+                    for j in range(6):
+                        nn = p+'_'+label+'_'+_nameU[j]
+                        self.params[nn].vary = True
+                else:
+                    nn = p+'_'+label+'_dw'
+                    self.params[nn].vary = True
+            else:
+                raise ValueError('element not present any of the phases')
+
+    '''
+        turn all the occupation factors on
+    '''
+    def params_occ_vary_all_on(self):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem = constants.ptableinverse[Z]
+
+                nn = p+'_'+elem+str(self.atom_label[i])+'_occ'
+                self.params[nn].vary = True
+
+    '''
+        turn all the occupation factors on
+    '''
+    def params_occ_vary_all_off(self):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem = constants.ptableinverse[Z]
+
+                nn = p+'_'+elem+str(self.atom_label[i])+'_occ'
+                self.params[nn].vary = False
+
+    '''
+        turn all the occupation factors 
+        for an atom label off
+    '''
+    def params_occ_vary_label_off(self, label):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+
+            elem_all = []
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem_all.append(constants.ptableinverse[Z])
+
+            elem = label[:-1]
+            if(elem in elem_all):
+                nn = p+'_'+label+'_occ'
+                self.params[nn].vary = False
+            else:
+                raise ValueError('element not present any of the phases')
+
+    '''
+        turn all the occupation factors 
+        for an atom label on
+    '''
+    def params_occ_vary_label_on(self, label):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+
+            elem_all = []
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem_all.append(constants.ptableinverse[Z])
+
+            elem = label[:-1]
+            if(elem in elem_all):
+                nn = p+'_'+label+'_occ'
+                self.params[nn].vary = True
+            else:
+                raise ValueError('element not present any of the phases')
+
+    '''
+        turn all the atom positions factors on
+    '''
+    def params_xyz_vary_all_on(self):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem = constants.ptableinverse[Z]
+
+                nn = p+'_'+elem+str(self.atom_label[i])+'_x'
+                self.params[nn].vary = True
+                nn = p+'_'+elem+str(self.atom_label[i])+'_y'
+                self.params[nn].vary = True
+                nn = p+'_'+elem+str(self.atom_label[i])+'_z'
+                self.params[nn].vary = True
+
+    '''
+        turn all the atom positions factors on
+    '''
+    def params_xyz_vary_all_off(self):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem = constants.ptableinverse[Z]
+
+                nn = p+'_'+elem+str(self.atom_label[i])+'_x'
+                self.params[nn].vary = False
+                nn = p+'_'+elem+str(self.atom_label[i])+'_y'
+                self.params[nn].vary = False
+                nn = p+'_'+elem+str(self.atom_label[i])+'_z'
+                self.params[nn].vary = False
+
+    '''
+        turn all the atom positions
+        for an atom label off
+    '''
+    def params_xyz_vary_label_off(self, label):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+
+            elem_all = []
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem_all.append(constants.ptableinverse[Z])
+
+            elem = label[:-1]
+            if(elem in elem_all):
+                nn = p+'_'+label+'_x'
+                self.params[nn].vary = False
+                nn = p+'_'+label+'_y'
+                self.params[nn].vary = False
+                nn = p+'_'+label+'_z'
+                self.params[nn].vary = False
+            else:
+                raise ValueError('element not present any of the phases')
+
+    '''
+        turn all the atom positions
+        for an atom label on
+    '''
+    def params_xyz_vary_label_on(self, label):
+
+        for p in self.phases:
+            l = list(self.phases[p].keys())[0]
+            mat = self.phases[p][l]
+            atom_type  = mat.atom_type
+
+            elem_all = []
+            for i in range(atom_type.shape[0]):
+                Z = atom_type[i]
+                elem_all.append(constants.ptableinverse[Z])
+
+            elem = label[:-1]
+            if(elem in elem_all):
+                nn = p+'_'+label+'_x'
+                self.params[nn].vary = True
+                nn = p+'_'+label+'_y'
+                self.params[nn].vary = True
+                nn = p+'_'+label+'_z'
+                self.params[nn].vary = True
+            else:
+                raise ValueError('element not present any of the phases')
+
+    def initialize_expt_spectrum(self, expt_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    load the experimental spectum of 2theta-intensity
+        '''
+        # self.spectrum_expt = Spectrum.from_file()
+        if(expt_file is not None):
+            if(path.exists(expt_file)):
+                self.spectrum_expt = Spectrum.from_file(expt_file,skip_rows=0)
+                self.tth_max = np.amax(self.spectrum_expt._x)
+                self.tth_min = np.amin(self.spectrum_expt._x)
+
+                ''' also initialize statistical weights for the error calculation'''
+                self.weights = 1.0 / np.sqrt(self.spectrum_expt.y)
+                self.initialize_bkg()
+            else:
+                raise FileError('input spectrum file doesn\'t exist.')
+
+    def initialize_bkg(self):
+
+        '''
+            the cubic spline seems to be the ideal route in terms
+            of determining the background intensity. this involves 
+            selecting a small (~5) number of points from the spectrum,
+            usually called the anchor points. a cubic spline interpolation
+            is performed on this subset to estimate the overall background.
+            scipy provides some useful routines for this
+        '''
+        self.selectpoints()
+        x = self.points[:,0]
+        y = self.points[:,1]
+        self.splinefit(x, y)
+
+    def selectpoints(self):
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        ax.set_title('Select 6 points for background estimation')
+
+        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=6)  # 6 points tolerance
+        plt.show()
+
+        self.points = np.asarray(plt.ginput(6,timeout=-1, show_clicks=True))
+        plt.close()
+
+    # cubic spline fit of background using custom points chosen from plot
+    def splinefit(self, x, y):
+        cs = CubicSpline(x,y)
+        bkg = cs(self.tth_list)
+        self.background = Spectrum(x=self.tth_list, y=bkg)
+
+    def initialize_phases(self, phase_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    load the phases for the LeBail fits
+        '''
+        p = Phases_Rietveld(wavelength=self.wavelength)
+        if(phase_file is not None):
+            if(path.exists(phase_file)):
+                p.load(phase_file)
+            else:
+                raise FileError('phase file doesn\'t exist.')
+        self.phases = p
+
+        self.calctth()
+        self.calcsf()
+
+    def calctth(self):
+        self.tth = {}
+        for p in self.phases:
+            self.tth[p] = {}
+            for k,l in self.phases.wavelength.items():
+                t,_ = self.phases[p][k].getTTh(l[0].value)
+                limit = np.logical_and(t >= self.tth_min,\
+                                       t <= self.tth_max)
+                self.tth[p][k] = t[limit]
+
+    def calcsf(self):
+        self.sf = {}
+        for p in self.phases:
+            self.sf[p] = {}
+            for k,l in self.phases.wavelength.items():
+                w_int = l[1]
+                t,tmask = self.phases[p][k].getTTh(l[0].value)
+                limit = np.logical_and(t >= self.tth_min,\
+                                       t <= self.tth_max)
+                hkl = self.phases[p][k].hkls[tmask][limit]
+                multiplicity = self.phases[p][k].multiplicity[tmask][limit]
+                sf = []
+                for m,g in zip(multiplicity,hkl):
+                    sf.append(w_int * m * self.phases[p][k].CalcXRSF(g))
+                self.sf[p][k] = np.array(sf)
+
+    def CagliottiH(self, tth, branch):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+                        07/20/2020 SS 1.1 branch keyword for asymmetric profiles
+        >> @DETAILS:    calculates the cagiotti parameter for the peak width
+
+        '''
+        th          = np.radians(0.5*tth)
+        tanth       = np.tan(th)
+        cth         = np.cos(th)
+        if(branch == 'l'):
+            Hsq         = self.Ul * tanth**2 + self.Vl * tanth + self.Wl + self.Pl / cth**2
+        elif(branch == 'r'):
+            Hsq         = self.Ur * tanth**2 + self.Vr * tanth + self.Wr + self.Pr / cth**2
+
+        if(Hsq < 0.):
+            Hsq = 1.0e-12
+        self.Hcag   = np.sqrt(Hsq)
+
+    def LorentzH(self, tth, branch):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       07/20/2020 SS 1.0 original
+        >> @DETAILS:    calculates the size and strain broadening for Lorentzian peak
+        '''
+        th = np.radians(0.5*tth)
+        tanth       = np.tan(th)
+        cth         = np.cos(th)
+        if(branch == 'l'):
+            self.gamma = self.Xl/cth + self.Yl * tanth
+        elif(branch == 'r'):
+            self.gamma = self.Xr/cth + self.Yr * tanth
+
+        if(self.gamma < 0.):
+            self.gamma = 1e-6
+
+    def MixingFact(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+        >> @DETAILS:    calculates the mixing factor eta
+        '''
+        self.eta = self.eta1 + self.eta2 * tth + self.eta3 * (tth)**2
+
+        if(self.eta > 1.0):
+            self.eta = 1.0
+
+        elif(self.eta < 0.0):
+            self.eta = 0.0
+
+    def Gaussian(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the gaussian peak profile
+        '''
+        mask = self.tth_list < tth
+        cg = 4.*np.log(2.)
+
+        self.CagliottiH(tth, 'l')
+        H  = self.Hcag
+        Il = (np.sqrt(cg/np.pi)/H) * np.exp( -cg * ((self.tth_list[mask] - tth)/H)**2 )
+
+        self.CagliottiH(tth, 'r')
+        H  = self.Hcag
+        Ir = (np.sqrt(cg/np.pi)/H) * np.exp( -cg * ((self.tth_list[~mask] - tth)/H)**2 )
+
+        if(Il.size == 0):
+            a = 0.
+            b = 1.
+        elif(Ir.size == 0):
+            a = 1.
+            b = 0.
+        else:
+            Ilm = np.amax(Il)
+            Irm = np.amax(Ir)
+            if(Ilm == 0):
+                a = 1.
+                b = 0.
+            elif(Irm == 0):
+                a = 0.
+                b = 1.
+            else:
+                b = 2./(1. + Irm/Ilm)
+                a = b * Irm / Ilm
+
+        self.GaussianI = np.hstack((a*Il, b*Ir))
+
+    def Lorentzian(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the lorentzian peak profile
+        '''
+        mask = self.tth_list < tth
+        cl = 4.
+
+        self.LorentzH(tth, 'l')
+        H = self.gamma
+        Il = (2./np.pi/H) / ( 1. + cl*((self.tth_list[mask] - tth)/H)**2)
+
+        self.LorentzH(tth, 'r')
+        H = self.gamma
+        Ir = (2./np.pi/H) / ( 1. + cl*((self.tth_list[~mask] - tth)/H)**2)
+
+        if(Il.size == 0):
+            a = 0.
+            b = 1.
+        elif(Ir.size == 0):
+            a = 1.
+            b = 0.
+        else:
+            Ilm = np.amax(Il)
+            Irm = np.amax(Ir)
+            if(Ilm == 0):
+                a = 1.
+                b = 0.
+            elif(Irm == 0):
+                a = 0.
+                b = 1.
+            else:
+                b = 2./(1. + Irm/Ilm)
+                a = b * Irm / Ilm
+
+        self.LorentzI = np.hstack((a*Il, b*Ir))
+
+    def PseudoVoight(self, tth):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/20/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the pseudo-voight function as weighted 
+                        average of gaussian and lorentzian
+        '''
+
+        self.Gaussian(tth)
+        self.Lorentzian(tth)
+        self.MixingFact(tth)
+
+        self.PV = self.eta * self.GaussianI + \
+                  (1.0 - self.eta) * self.LorentzI
+
+    def PolarizationFactor(self):
+
+        tth = np.radians(self.tth_list)
+        self.LP = (1 + np.cos(tth)**2)/ \
+        np.cos(0.5*tth)/np.sin(0.5*tth)**2
+
+    def computespectrum(self):
+
+        I = np.zeros(self.tth_list.shape)
+        for p in self.tth:
+            for l in self.tth[p]:
+
+                tth = self.tth[p][l]
+                sf  = self.sf[p][l]
+                pf = self.phases[p][l].pf / self.phases[p][l].vol**2
+
+                for t,fsq in zip(tth,sf):
+                    self.PseudoVoight(t+self.zero_error)
+                    I += self.scale * pf * self.PV * fsq * self.LP
+
+        self.spectrum_sim = Spectrum(self.tth_list, I) + self.background
+
+    def calcRwp(self, params):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the weighted error between calculated and
+                        experimental spectra. goodness of fit is also calculated. the 
+                        weights are the inverse squareroot of the experimental intensities
+        '''
+
+        '''
+        the err variable is the difference between simulated and experimental spectra
+        '''
+        for p in params:
+            if(hasattr(self, p)):
+                setattr(self, p, params[p].value)
+
+        self.updated_lp = False
+        self.updated_atominfo = False
+        for p in self.phases:
+            for l in self.phases[p]:
+
+                mat = self.phases[p][l]
+
+                '''
+                PART 1: update the lattice parameters
+                '''
+                lp = []
+
+                pre = p + '_'
+                if(pre+'a' in params):
+                    if(params[pre+'a'].vary):
+                        lp.append(params[pre+'a'].value)
+                if(pre+'b' in params):
+                    if(params[pre+'b'].vary):
+                        lp.append(params[pre+'b'].value)
+                if(pre+'c' in params):
+                    if(params[pre+'c'].vary):
+                        lp.append(params[pre+'c'].value)
+                if(pre+'alpha' in params):
+                    if(params[pre+'alpha'].vary):
+                        lp.append(params[pre+'alpha'].value)
+                if(pre+'beta' in params):
+                    if(params[pre+'beta'].vary):
+                        lp.append(params[pre+'beta'].value)
+                if(pre+'gamma' in params):
+                    if(params[pre+'gamma'].vary):
+                        lp.append(params[pre+'gamma'].value)
+
+                if(not lp):
+                    pass
+                else:
+                    lp = self.phases[p][l].Required_lp(lp)
+                    self.phases[p][l].lparms = np.array(lp)
+                    self.updated_lp = True
+                '''
+                PART 2: update the atom info
+                '''
+
+                atom_type = mat.atom_type
+
+                for i in range(atom_type.shape[0]):
+
+                    Z = atom_type[i]
+                    elem = constants.ptableinverse[Z]
+                    nx = p+'_'+elem+str(self.atom_label[i])+'_x'
+                    ny = p+'_'+elem+str(self.atom_label[i])+'_y'
+                    nz = p+'_'+elem+str(self.atom_label[i])+'_z'
+                    oc = p+'_'+elem+str(self.atom_label[i])+'_occ'
+
+                    if(mat.aniU):
+                        Un = []
+                        for j in range(6):
+                            Un.append(p+'_'+elem+str(self.atom_label[i])+'_'+_nameU[j])
+                    else:
+                        dw = p+'_'+elem+str(self.atom_label[i])+'_dw'
+
+                    if(nx in params):
+                        x = params[nx].value
+                        self.updated_atominfo = True
+                    else:
+                        x = self.params[nx].value
+
+                    if(ny in params):
+                        y = params[ny].value
+                        self.updated_atominfo = True
+                    else:
+                        y = self.params[ny].value
+
+                    if(nz in params):
+                        z = params[nz].value
+                        self.updated_atominfo = True
+                    else:
+                        z = self.params[nz].value
+
+                    if(oc in params):
+                        oc = params[oc].value
+                        self.updated_atominfo = True
+                    else:
+                        oc = self.params[oc].value
+
+                    if(mat.aniU):
+                        U = []
+                        for j in range(6):
+                            if(Un[j] in params):
+                                self.updated_atominfo = True
+                                U.append(params[Un[j]].value)
+                            else:
+                                U.append(self.params[Un[j]].value)
+                        U = np.array(U)
+                        mat.U[i,:] = U
+                    else:
+                        if(dw in params):
+                            dw = params[dw].value
+                            self.updated_atominfo = True
+                        else:
+                            dw = self.params[dw].value
+                        mat.U[i] = dw
+
+                    mat.atom_pos[i,:] = np.array([x,y,z,oc])
+
+                if(mat.aniU):
+                    mat.calcBetaij()
+                if(self.updated_lp):
+                    mat._calcrmt()
+
+        if(self.updated_lp):
+            self.calctth()
+        if(self.updated_lp or self.updated_atominfo):
+            self.calcsf()
+
+        self.computespectrum()
+
+        self.err = (self.spectrum_sim - self.spectrum_expt)
+
+        errvec = np.sqrt(self.weights * self.err._y**2)
+
+        ''' weighted sum of square '''
+        wss = np.trapz(self.weights * self.err._y**2, self.err._x)
+
+        den = np.trapz(self.weights * self.spectrum_sim._y**2, self.spectrum_sim._x)
+
+        ''' standard Rwp i.e. weighted residual '''
+        Rwp = np.sqrt(wss/den)
+
+        ''' number of observations to fit i.e. number of data points '''
+        N = self.spectrum_sim._y.shape[0]
+
+        ''' number of independent parameters in fitting '''
+        P = len(params)
+        Rexp = np.sqrt((N-P)/den)
+
+        # Rwp and goodness of fit parameters
+        self.Rwp = Rwp
+        self.gofF = (Rwp / Rexp)**2
+
+        return errvec
+
+    def initialize_lmfit_parameters(self):
+
+        params = lmfit.Parameters()
+
+        for p in self.params:
+            par = self.params[p]
+            if(par.vary):
+                params.add(p, value=par.value, min=par.lb, max = par.ub)
+
+        return params
+
+    def update_parameters(self):
+
+        for p in self.res.params:
+            par = self.res.params[p]
+            self.params[p].value = par.value
+
+    def Refine(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    this routine performs the least squares refinement for all variables
+                        which are allowed to be varied.
+        '''
+
+        params = self.initialize_lmfit_parameters()
+
+        fdict = {'ftol':1e-4, 'xtol':1e-4, 'gtol':1e-4, \
+                 'verbose':0, 'max_nfev':8}
+
+        fitter = lmfit.Minimizer(self.calcRwp, params)
+
+        self.res = fitter.least_squares(**fdict)
+
+        self.update_parameters()
+
+        self.niter += 1
+        self.Rwplist  = np.append(self.Rwplist, self.Rwp)
+        self.gofFlist = np.append(self.gofFlist, self.gofF)
+
+        print('Finished iteration. Rwp: {:.3f} % goodness of fit: {:.3f}'.format(self.Rwp*100., self.gofF))
+
+    @property
+    def Ul(self):
+        return self._Ul
+
+    @Ul.setter
+    def Ul(self, Uinp):
+        self._Ul = Uinp
+        # self.computespectrum()
+        return
+
+    @property
+    def Vl(self):
+        return self._Vl
+
+    @Vl.setter
+    def Vl(self, Vinp):
+        self._Vl = Vinp
+        # self.computespectrum()
+        return
+
+    @property
+    def Wl(self):
+        return self._Wl
+
+    @Wl.setter
+    def Wl(self, Winp):
+        self._Wl = Winp
+        # self.computespectrum()
+        return
+
+    @property
+    def Pl(self):
+        return self._Pl
+
+    @Pl.setter
+    def Pl(self, Pinp):
+        self._Pl = Pinp
+        return
+
+    @property
+    def Xl(self):
+        return self._Xl
+
+    @Xl.setter
+    def Xl(self, Xinp):
+        self._Xl = Xinp
+        return
+
+    @property
+    def Yl(self):
+        return self._Yl
+
+    @Yl.setter
+    def Yl(self, Yinp):
+        self._Yl = Yinp
+        return
+
+    @property
+    def Ur(self):
+        return self._Ur
+
+    @Ur.setter
+    def Ur(self, Uinp):
+        self._Ur = Uinp
+        return
+
+    @property
+    def Vr(self):
+        return self._Vr
+
+    @Vr.setter
+    def Vr(self, Vinp):
+        self._Vr = Vinp
+        return
+
+    @property
+    def Wr(self):
+        return self._Wr
+
+    @Wr.setter
+    def Wr(self, Winp):
+        self._Wr = Winp
+        return
+
+    @property
+    def Pr(self):
+        return self._Pr
+
+    @Pr.setter
+    def Pr(self, Pinp):
+        self._Pr = Pinp
+        return
+
+    @property
+    def Xr(self):
+        return self._Xr
+
+    @Xr.setter
+    def Xr(self, Xinp):
+        self._Xr = Xinp
+        return
+
+    @property
+    def Yr(self):
+        return self._Yr
+
+    @Yr.setter
+    def Yr(self, Yinp):
+        self._Yr = Yinp
+        return
+
+    @property
+    def gamma(self):
+        return self._gamma
     
+    @gamma.setter
+    def gamma(self, val):
+        self._gamma = val
+
+    @property
+    def Hcag(self):
+        return self._Hcag
+
+    @Hcag.setter
+    def Hcag(self, val):
+        self._Hcag = val
+
+    @property
+    def eta1(self):
+        return self._eta1
+
+    @eta1.setter
+    def eta1(self, val):
+        self._eta1 = val
+        return
+
+    @property
+    def eta2(self):
+        return self._eta2
+
+    @eta2.setter
+    def eta2(self, val):
+        self._eta2 = val
+        return
+
+    @property
+    def eta3(self):
+        return self._eta3
+
+    @eta3.setter
+    def eta3(self, val):
+        self._eta3 = val
+        return
+
+    @property
+    def tth_list(self):
+        return self.spectrum_expt._x
+
+    @property
+    def zero_error(self):
+        return self._zero_error
+    
+    @zero_error.setter
+    def zero_error(self, value):
+        self._zero_error = value
+        return
+
+    @property
+    def scale(self):
+        return self._scale
 
     @scale.setter
     def scale(self, value):
