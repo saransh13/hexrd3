@@ -6,6 +6,7 @@ from hexrd.material import Material
 from hexrd.valunits import valWUnit
 from hexrd import spacegroup as SG
 from hexrd import symmetry, symbols, constants
+from hexrd import FPA
 import lmfit
 import matplotlib.pyplot as plt
 from scipy.interpolate import CubicSpline, interp1d
@@ -1827,6 +1828,527 @@ class LeBail:
         # self.computespectrum()
         return
 
+class LeBail_FPA:
+    ''' ======================================================================================================== 
+        ======================================================================================================== 
+
+    >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+    >> @DATE:       07/31/2020 SS 1.0 original
+    >> @DETAILS:    this is the Lebail class using the fundamental parameter approach
+                    the peak shapes are computed as convolution of different contributions
+
+                    @NOTE: All angles are always going to be in degrees
+        ======================================================================================================== 
+        ======================================================================================================== 
+    '''
+    def __init__(self,expt_file=None,param_file=None,phase_file=None,flux_file=None):
+
+        self.zero_error = 0.
+        self.initialize_expt_spectrum(expt_file)
+
+        self.extract_wavelength(flux_file)
+        self._tstart = time.time()
+        self.initialize_phases(phase_file)
+        self.initialize_parameters(param_file)
+        self.initialize_FP_profiles()
+        self.initialize_Icalc()
+        self.computespectrum()
+
+        self._tstop = time.time()
+        self.tinit = self._tstop - self._tstart
+        self.niter = 0
+        self.Rwplist  = np.empty([0])
+        self.gofFlist = np.empty([0])
+
+    def extract_wavelength(self, flux_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    load the spectum of the xray beam. this is written especially with 
+                        the pink beam in mind
+        '''
+        if(flux_file is not None):
+            fid = open(flux_file, 'r')
+            mat = []
+            for line in fid:
+                mat.append([float(x) for x in line.split()])
+            mat = np.array(mat)
+
+            self.mat_wavelengths = 1e-10 * 12.39841984/mat[:,0]
+            self.mat_intensities = mat[:,1]/np.trapz(mat[:,1])
+            self.dominant_wavelength = 0.52368e-10 #self.mat_wavelengths[np.argmax(self.mat_intensities)]
+
+        else:
+            raise FileError('Need to supply the flux-energy file')
+
+    def initialize_parameters(self, param_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    initialize parameter list from file. if no file given, then initialize
+                        to some default values (lattice constants are for CeO2)
+
+        '''
+        params = Parameters()
+        if(param_file is not None):
+            if(path.exists(param_file)):
+                params.load(param_file)
+                '''
+                this part initializes the lattice parameters in the 
+                paramter list
+                '''
+                for p in self.phases:
+
+                    mat = self.phases[p]
+                    lp       = np.array(mat.lparms)
+                    rid      = list(_rqpDict[mat.latticeType][0])
+
+                    lp       = lp[rid]
+                    name     = _lpname[rid]
+
+                    for n,l in zip(name,lp):
+                        nn = p+'_'+n
+                        '''
+                        is l is small, it is one of the length units
+                        else it is an angle
+                        '''
+                        if(l < 10.):
+                            params.add(nn,value=l,lb=l-0.05,ub=l+0.05,vary=False)
+                        else:
+                            params.add(nn,value=l,lb=l-1.,ub=l+1.,vary=False)
+
+            else:
+                raise FileError('parameter file doesn\'t exist.')
+
+        else:
+            raise FileError('parameter file not specified.')
+
+        self.params = params
+
+        self._gauss_width = self.params['gauss_width'].value
+        self._lor_width = self.params['gauss_width'].value
+        self._crystallite_size = self.params['crystallite_size'].value
+        self._zero_error = self.params['zero_error'].value
+
+    def initialize_expt_spectrum(self, expt_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    load the experimental spectum of 2theta-intensity
+        '''
+        # self.spectrum_expt = Spectrum.from_file()
+        if(expt_file is not None):
+            if(path.exists(expt_file)):
+                self.spectrum_expt = Spectrum.from_file(expt_file,skip_rows=0)
+                self.tth_max = np.amax(self.spectrum_expt._x)
+                self.tth_min = np.amin(self.spectrum_expt._x)
+                ''' also initialize statistical weights for the error calculation'''
+                self.weights = 1.0 / np.sqrt(self.spectrum_expt.y)
+                self.initialize_bkg()
+            else:
+                raise FileError('input spectrum file doesn\'t exist.')
+
+    def initialize_bkg(self):
+        '''
+            the cubic spline seems to be the ideal route in terms
+            of determining the background intensity. this involves 
+            selecting a small (~5) number of points from the spectrum,
+            usually called the anchor points. a cubic spline interpolation
+            is performed on this subset to estimate the overall background.
+            scipy provides some useful routines for this
+        '''
+        self.selectpoints()
+        x = self.points[:,0]
+        y = self.points[:,1]
+        self.splinefit(x, y)
+
+    def selectpoints(self):
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        ax.set_title('Select 5 points for background estimation')
+        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=8)  # 5 points tolerance
+        plt.show()
+        self.points = np.asarray(plt.ginput(8,timeout=-1, show_clicks=True))
+        plt.close()
+
+
+    # cubic spline fit of background using custom points chosen from plot
+    def splinefit(self, x, y):
+        cs = CubicSpline(x,y)
+        bkg = cs(self.tth_list)
+        self.background = Spectrum(x=self.tth_list, y=bkg)
+
+    def initialize_phases(self, phase_file):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    load the phases for the LeBail fits
+        '''
+        if(hasattr(self,'wavelength')):
+            if(self.wavelength is not None):
+                p = Phases_LeBail(wavelength=self.wavelength)
+        else:
+            p = Phases_LeBail()
+        if(phase_file is not None):
+            if(path.exists(phase_file)):
+                p.load(phase_file)
+            else:
+                raise FileError('phase file doesn\'t exist.')
+        self.phases = p
+        self.calctth()
+
+
+    def calctth(self):
+        self.tth = {}
+        for p in self.phases:
+            self.tth[p] = {}
+            t = self.phases[p].getTTh(self.dominant_wavelength*1e9)
+            limit = np.logical_and(t >= self.tth_min,\
+                                   t <= self.tth_max)
+            self.tth[p] = t[limit]
+
+
+    def initialize_Icalc(self):
+        self.Icalc = {}
+        for p in self.phases:
+            self.Icalc[p] = 1000.0 * np.ones(self.tth[p].shape)
+
+    def initialize_FP_profiles(self):
+
+        self.window_width = 25.0
+
+        self.FP = FPA.FP_profile(anglemode="twotheta",
+        output_gaussian_smoother_bins_sigma=1.0,
+        oversampling=2)
+
+        self.FP.debug_cache=False
+
+        '''
+        set parameters for each convolver
+        this part makes the convolver for the emission spectrum
+        of the x-rays
+
+        @params:
+        mat_wavelengths is the vector of wavelengths in the spectrum
+        mat_intensities is the vector of weights for each wavelength
+        mat_gauss_widths is the vector of gaussian widths for each of the wavelengths
+        mat_lor_widths is the vector of lorentzian widths for each of the wavelengths
+        crystallite_size_gauss is the average crystallite size for gaussian broadening in inverse m
+        crystallite_size_gauss is the average crystallite size for lorentzian broadening in inverse m
+        '''
+        mat_gauss_widths = np.array([self.gauss_width]*self.mat_wavelengths.shape[0]) 
+        mat_lor_widths   = np.array([self.lor_width]*self.mat_wavelengths.shape[0])
+
+        gauss_crystallite_size = self.crystallite_size
+        lor_crystallite_size = self.crystallite_size
+
+        self.FP.set_parameters(convolver="emission",
+            emiss_wavelengths = self.mat_wavelengths,
+            emiss_intensities = self.mat_intensities,
+            emiss_gauss_widths = mat_gauss_widths,
+            emiss_lor_widths = mat_lor_widths,
+            crystallite_size_gauss = gauss_crystallite_size,
+            crystallite_size_lor = lor_crystallite_size)
+
+        '''
+        set up parameters for the absorption convolver
+
+        @params:
+        absorption coefficient is the exponential coefficient in inverse m
+        sample_thickness is the thickness of the sample in transmission
+        '''
+        self.FP.set_parameters(convolver="absorption",
+        absorption_coefficient=800.0*100, #like LaB6, in m^(-1)
+        sample_thickness=1e-3)
+
+        # self.FP.set_parameters(convolver="size_distribution",
+        # lognormal_mean=4.35,
+        # lognormal_std=0.387,
+        # )
+
+        '''
+        set up parameters for the silicon position sensitive detector
+
+        @params:
+        si_psd_window_bounds 
+        '''
+        self.FP.set_parameters(convolver="si_psd",
+        si_psd_window_bounds=(0.,2.5e-3))
+
+    def computespectrum(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    compute the simulated spectrum
+        '''
+        x = self.tth_list
+        y = np.zeros(x.shape)
+        ww = self.window_width
+
+        for iph,p in enumerate(self.phases):
+
+            Ic = self.Icalc[p]
+
+            tth = self.tth[p] + self.zero_error
+            n = np.min((tth.shape[0],Ic.shape[0]))
+
+            for i in range(n):
+
+                twotheta_x = tth[i]
+
+                #put the compute window in the right place and clear all histories
+                self.FP.set_window(twotheta_output_points=1000,
+                    twotheta_window_center_deg=twotheta_x,
+                    twotheta_window_fullwidth_deg=ww,
+                )
+
+                #set parameters which are shared by many things
+                self.FP.set_parameters(twotheta0_deg=twotheta_x,
+                    dominant_wavelength=self.dominant_wavelength,
+                    diffractometer_radius=89.0e-3)
+
+                self.FP.set_parameters(equatorial_divergence_deg=1.0)
+  
+                prof = self.FP.compute_line_profile()
+                xx = prof.twotheta_deg
+                yy = prof.peak/np.trapz(prof.peak, xx)
+                spline = CubicSpline(xx,yy,extrapolate=False) 
+                y  += Ic[i] * np.nan_to_num(spline(x)) 
+
+        self.spectrum_sim = Spectrum(x=x, y=y)
+        self.spectrum_sim = self.spectrum_sim + self.background
+
+    def CalcIobs(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    this is one of the main functions to partition the expt intensities
+                        to overlapping peaks in the calculated pattern
+        '''
+
+        self.Iobs = {}
+        ww = self.window_width
+        for iph,p in enumerate(self.phases):
+
+            Ic = self.Icalc[p]
+
+            tth = self.tth[p] + self.zero_error
+
+            Iobs = []
+            n = np.min((tth.shape[0],Ic.shape[0]))
+
+            for i in range(n):
+
+                twotheta_x = tth[i]
+                
+                #put the compute window in the right place and clear all histories
+                self.FP.set_window(twotheta_output_points=500,
+                    twotheta_window_center_deg=twotheta_x,
+                    twotheta_window_fullwidth_deg=ww,
+                )
+
+                #set parameters which are shared by many things
+                self.FP.set_parameters(twotheta0_deg=twotheta_x,
+                    dominant_wavelength=self.dominant_wavelength,
+                    diffractometer_radius=217.5e-3)
+
+                self.FP.set_parameters(equatorial_divergence_deg=-1.0)
+
+                prof = self.FP.compute_line_profile()
+                xx = prof.twotheta_deg
+                yy = prof.peak/np.trapz(prof.peak, xx)
+
+                spline = CubicSpline(xx,yy,extrapolate=False) 
+                y  = Ic[i] * np.nan_to_num(spline(self.tth_list)) 
+
+                _,yo  = self.spectrum_expt.data
+                _,yc  = self.spectrum_sim.data
+
+                I = np.trapz(yo * y / yc, self.tth_list)
+                Iobs.append(I)
+
+            self.Iobs[p] = np.array(Iobs)
+
+    def calcRwp(self, params):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    this routine computes the weighted error between calculated and
+                        experimental spectra. goodness of fit is also calculated. the 
+                        weights are the inverse squareroot of the experimental intensities
+        '''
+
+        '''
+        the err variable is the difference between simulated and experimental spectra
+        '''
+
+        if(self.params['zero_error'].vary):
+            self.zero_error = self.params['zero_error'].value
+        if( self.params['gauss_width'].vary or 
+            self.params['lor_width'].vary or
+            self.params['crystallite_size'].vary):
+
+            mat_gauss_widths = np.array([self.params['gauss_width'].value]*self.mat_wavelengths.shape[0])
+            mat_lor_widths = np.array([self.params['lor_width'].value]*self.mat_wavelengths.shape[0])
+
+            self._crystallite_size   = self.params['crystallite_size'].value
+            self._gauss_width        = self.params['gauss_width'].value
+            self._lor_width          = self.params['lor_width'].value
+
+            self.FP.set_parameters(convolver="emission",
+                emiss_wavelengths = self.mat_wavelengths,
+                emiss_intensities = self.mat_intensities,
+                emiss_gauss_widths = mat_gauss_widths,
+                emiss_lor_widths = mat_lor_widths,
+                crystallite_size_gauss = self.crystallite_size*1e-9,
+                crystallite_size_lor = self.crystallite_size*1e-9)
+
+        for p in self.phases:
+
+            mat = self.phases[p]
+
+            '''
+            PART 1: update the lattice parameters
+            '''
+            lp = []
+
+            pre = p + '_'
+            if(pre+'a' in params):
+                if(params[pre+'a'].vary):
+                    lp.append(params[pre+'a'].value)
+            if(pre+'b' in params):
+                if(params[pre+'b'].vary):
+                    lp.append(params[pre+'b'].value)
+            if(pre+'c' in params):
+                if(params[pre+'c'].vary):
+                    lp.append(params[pre+'c'].value)
+            if(pre+'alpha' in params):
+                if(params[pre+'alpha'].vary):
+                    lp.append(params[pre+'alpha'].value)
+            if(pre+'beta' in params):
+                if(params[pre+'beta'].vary):
+                    lp.append(params[pre+'beta'].value)
+            if(pre+'gamma' in params):
+                if(params[pre+'gamma'].vary):
+                    lp.append(params[pre+'gamma'].value)
+
+            if(not lp):
+                pass
+            else:
+                lp = self.phases[p].Required_lp(lp)
+                self.phases[p].lparms = np.array(lp)
+                self.phases[p]._calcrmt()
+                self.calctth()
+
+        self.computespectrum()
+
+        self.err = (self.spectrum_sim - self.spectrum_expt)
+
+        errvec = np.sqrt(self.weights * self.err._y**2)
+
+        ''' weighted sum of square '''
+        wss = np.trapz(self.weights * self.err._y**2, self.err._x)
+
+        den = np.trapz(self.weights * self.spectrum_sim._y**2, self.spectrum_sim._x)
+
+        ''' standard Rwp i.e. weighted residual '''
+        Rwp = np.sqrt(wss/den)
+
+        ''' number of observations to fit i.e. number of data points '''
+        N = self.spectrum_sim._y.shape[0]
+
+        ''' number of independent parameters in fitting '''
+        P = len(params)
+        Rexp = np.sqrt((N-P)/den)
+
+        # Rwp and goodness of fit parameters
+        self.Rwp = Rwp
+        self.gofF = (Rwp / Rexp)**2
+
+        return errvec
+
+    def initialize_lmfit_parameters(self):
+
+        params = lmfit.Parameters()
+
+        for p in self.params:
+            par = self.params[p]
+            if(par.vary):
+                params.add(p, value=par.value, min=par.lb, max = par.ub)
+
+        return params
+
+    def update_parameters(self):
+
+        for p in self.res.params:
+            par = self.res.params[p]
+            self.params[p].value = par.value
+
+    def RefineCycle(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       06/08/2020 SS 1.0 original
+        >> @DETAILS:    this is one refinement cycle for the least squares, typically few
+                        10s to 100s of cycles may be required for convergence
+        '''
+        self.CalcIobs()
+        self.Icalc = self.Iobs
+        self.res = self.Refine()
+        self.update_parameters()
+        self.niter += 1
+        self.Rwplist  = np.append(self.Rwplist, self.Rwp)
+        self.gofFlist = np.append(self.gofFlist, self.gofF)
+        print('Finished iteration. Rwp: {:.3f} % goodness of fit: {:.3f}'.format(self.Rwp*100., self.gofF))
+
+    def Refine(self):
+        '''
+        >> @AUTHOR:     Saransh Singh, Lawrence Livermore National Lab, saransh1@llnl.gov
+        >> @DATE:       05/19/2020 SS 1.0 original
+        >> @DETAILS:    this routine performs the least squares refinement for all variables
+                        which are allowed to be varied.
+        '''
+
+        params = self.initialize_lmfit_parameters()
+        for p in params: 
+            if(params[p].vary):
+                print(p, params[p].value)
+        print('\n')
+
+        fdict = {'ftol':1e-4, 'xtol':1e-4, 'gtol':1e-4, \
+                 'verbose':0, 'max_nfev':100}
+
+        fitter = lmfit.Minimizer(self.calcRwp, params)
+
+        res = fitter.least_squares(**fdict)
+        return res
+
+    @property
+    def tth_list(self):
+        return self.spectrum_expt._x
+
+    @property
+    def gauss_width(self):
+        return self._gauss_width
+    
+    @property
+    def lor_width(self):
+        return self._lor_width
+
+    @property
+    def crystallite_size(self):
+        return self._crystallite_size
+    
+
+    @property
+    def zero_error(self):
+        return self._zero_error
+    
+    @zero_error.setter
+    def zero_error(self, value):
+        self._zero_error = value
+        # self.computespectrum()
+        return
+
 class LeBail_Asym:
     ''' ======================================================================================================== 
         ======================================================================================================== 
@@ -1851,6 +2373,9 @@ class LeBail_Asym:
 
         self.initialize_expt_spectrum(expt_file)
 
+        '''
+        wavelength for the FPA needs to be in Angstroms
+        '''
         if(wavelength is not None):
             self.wavelength = wavelength
 
@@ -2005,12 +2530,12 @@ class LeBail_Asym:
 
         fig = plt.figure()
         ax = fig.add_subplot(111)
-        ax.set_title('Select 5 points for background estimation')
+        ax.set_title('Select 7 points for background estimation')
 
-        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=8)  # 5 points tolerance
+        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=7)  # 5 points tolerance
         plt.show()
 
-        self.points = np.asarray(plt.ginput(8,timeout=-1, show_clicks=True))
+        self.points = np.asarray(plt.ginput(7,timeout=-1, show_clicks=True))
         plt.close()
 
     # cubic spline fit of background using custom points chosen from plot
@@ -2137,8 +2662,15 @@ class LeBail_Asym:
         else:
             Ilm = np.amax(Il)
             Irm = np.amax(Ir)
-            b = 2./(1. + Irm/Ilm)
-            a = b * Irm / Ilm
+            if(Ilm == 0):
+                a = 1.
+                b = 0.
+            elif(Irm == 0):
+                a = 0.
+                b = 1.
+            else:
+                b = 2./(1. + Irm/Ilm)
+                a = b * Irm / Ilm
 
         self.GaussianI = np.hstack((a*Il, b*Ir))
 
@@ -2168,8 +2700,15 @@ class LeBail_Asym:
         else:
             Ilm = np.amax(Il)
             Irm = np.amax(Ir)
-            b = 2./(1. + Irm/Ilm)
-            a = b * Irm / Ilm
+            if(Ilm == 0):
+                a = 1.
+                b = 0.
+            elif(Irm == 0):
+                a = 0.
+                b = 1.
+            else:
+                b = 2./(1. + Irm/Ilm)
+                a = b * Irm / Ilm
 
         self.LorentzI = np.hstack((a*Il, b*Ir))
 
@@ -4122,10 +4661,10 @@ class Rietveld:
         ax = fig.add_subplot(111)
         ax.set_title('Select 5 points for background estimation')
 
-        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=8)  # 5 points tolerance
+        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=7)  # 5 points tolerance
         plt.show()
 
-        self.points = np.asarray(plt.ginput(8,timeout=-1, show_clicks=True))
+        self.points = np.asarray(plt.ginput(7,timeout=-1, show_clicks=True))
         plt.close()
 
     # cubic spline fit of background using custom points chosen from plot
@@ -5205,12 +5744,12 @@ class Rietveld_Asym:
 
         fig = plt.figure()
         ax = fig.add_subplot(111)
-        ax.set_title('Select 6 points for background estimation')
+        ax.set_title('Select 7 points for background estimation')
 
-        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=6)  # 6 points tolerance
+        line = ax.plot(self.tth_list, self.spectrum_expt._y, '-b', picker=7)  # 6 points tolerance
         plt.show()
 
-        self.points = np.asarray(plt.ginput(6,timeout=-1, show_clicks=True))
+        self.points = np.asarray(plt.ginput(7,timeout=-1, show_clicks=True))
         plt.close()
 
     # cubic spline fit of background using custom points chosen from plot
