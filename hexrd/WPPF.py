@@ -1630,8 +1630,8 @@ class LeBail:
                 lp = self.phases[p].Required_lp(lp)
                 self.phases[p].lparms = np.array(lp)
                 self.phases[p]._calcrmt()
-                self.calctth()
 
+        self.calctth()
         self.computespectrum()
 
         self.err = (self.spectrum_sim - self.spectrum_expt)
